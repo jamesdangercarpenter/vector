@@ -1234,6 +1234,7 @@ fn create_consumer(
             acknowledgements,
             callbacks,
             Span::current(),
+            config.auth.msk_iam_token_provider(),
         ))
         .context(CreateSnafu)?;
 
@@ -1274,11 +1275,13 @@ impl KafkaSourceContext {
         acknowledgements: bool,
         callbacks: UnboundedSender<KafkaCallback>,
         span: Span,
+        msk_iam_token_provider: Option<kafka::MskIamTokenProvider>,
     ) -> Self {
         Self {
             stats: kafka::KafkaStatisticsContext {
                 expose_lag_metrics,
                 span,
+                msk_iam_token_provider,
             },
             acknowledgements,
             consumer: OnceLock::default(),
@@ -1360,8 +1363,18 @@ impl KafkaSourceContext {
 }
 
 impl ClientContext for KafkaSourceContext {
+    const ENABLE_REFRESH_OAUTH_TOKEN: bool =
+        kafka::KafkaStatisticsContext::ENABLE_REFRESH_OAUTH_TOKEN;
+
     fn stats(&self, statistics: Statistics) {
         self.stats.stats(statistics)
+    }
+
+    fn generate_oauth_token(
+        &self,
+        oauthbearer_config: Option<&str>,
+    ) -> Result<rdkafka::client::OAuthToken, Box<dyn std::error::Error>> {
+        self.stats.generate_oauth_token(oauthbearer_config)
     }
 }
 

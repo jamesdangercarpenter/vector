@@ -13,7 +13,7 @@ use vrl::path::OwnedTargetPath;
 use super::config::KafkaSinkConfig;
 use crate::{
     config::SinkHealthcheckOptions,
-    kafka::KafkaStatisticsContext,
+    kafka::{KafkaStatisticsContext, MskIamTokenProvider},
     sinks::{
         kafka::{request_builder::KafkaRequestBuilder, service::KafkaService},
         prelude::*,
@@ -38,11 +38,13 @@ pub struct KafkaSink {
 
 pub(crate) fn create_producer(
     client_config: ClientConfig,
+    msk_iam_token_provider: Option<MskIamTokenProvider>,
 ) -> crate::Result<FutureProducer<KafkaStatisticsContext>> {
     let producer = client_config
         .create_with_context(KafkaStatisticsContext {
             expose_lag_metrics: false,
             span: Span::current(),
+            msk_iam_token_provider,
         })
         .context(KafkaCreateFailedSnafu)?;
     Ok(producer)
@@ -51,7 +53,7 @@ pub(crate) fn create_producer(
 impl KafkaSink {
     pub(crate) fn new(config: KafkaSinkConfig) -> crate::Result<Self> {
         let producer_config = config.to_rdkafka()?;
-        let producer = create_producer(producer_config)?;
+        let producer = create_producer(producer_config, config.auth.msk_iam_token_provider())?;
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
@@ -132,8 +134,21 @@ pub(crate) async fn healthcheck(
         },
     };
 
+    let msk_iam_token_provider = config.auth.msk_iam_token_provider();
     tokio::task::spawn_blocking(move || {
-        let producer: BaseProducer = client_config.create().unwrap();
+        let has_msk_iam = msk_iam_token_provider.is_some();
+        let producer: BaseProducer<KafkaStatisticsContext> = client_config
+            .create_with_context(KafkaStatisticsContext {
+                expose_lag_metrics: false,
+                span: Span::current(),
+                msk_iam_token_provider,
+            })
+            .unwrap();
+        if has_msk_iam {
+            // Serve the initial OAuth token refresh event so an MSK IAM token is set before
+            // connecting to fetch metadata.
+            producer.poll(Duration::from_secs(1));
+        }
         let topic = topic.as_ref().map(|topic| &topic[..]);
 
         producer
