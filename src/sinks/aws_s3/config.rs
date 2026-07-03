@@ -115,6 +115,14 @@ pub struct S3SinkConfig {
     #[configurable(metadata(docs::examples = "json"))]
     pub filename_extension: Option<String>,
 
+    /// Validate WRITE permission at startup by putting a small marker object under the
+    /// configured `key_prefix`, in addition to the read-only bucket healthcheck.
+    /// Catches write-permission misconfiguration — which the default `HeadBucket`
+    /// check cannot detect — before any events flow. The marker is left in place
+    /// (overwritten each start).
+    #[serde(default)]
+    pub verify_write_permission: bool,
+
     #[serde(flatten)]
     pub options: S3Options,
 
@@ -202,6 +210,7 @@ impl GenerateConfig for S3SinkConfig {
             filename_time_format: default_filename_time_format(),
             filename_append_uuid: true,
             filename_extension: None,
+            verify_write_permission: false,
             options: S3Options::default(),
             region: RegionOrEndpoint::default(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
@@ -352,7 +361,15 @@ impl S3SinkConfig {
     }
 
     pub fn build_healthcheck(&self, client: S3Client) -> crate::Result<Healthcheck> {
-        s3_common::config::build_healthcheck(self.bucket.clone(), client)
+        if self.verify_write_permission {
+            s3_common::config::build_write_healthcheck(
+                self.bucket.clone(),
+                self.key_prefix.clone(),
+                client,
+            )
+        } else {
+            s3_common::config::build_healthcheck(self.bucket.clone(), client)
+        }
     }
 
     pub async fn create_service(&self, proxy: &ProxyConfig) -> crate::Result<S3Service> {
@@ -428,6 +445,7 @@ mod tests {
             filename_time_format: super::default_filename_time_format(),
             filename_append_uuid: true,
             filename_extension: None,
+            verify_write_permission: false,
             options: S3Options::default(),
             region: crate::aws::RegionOrEndpoint::with_both("us-east-1", "http://localhost:4566"),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
