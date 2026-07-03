@@ -1,0 +1,56 @@
+# Laravel Cloud — build & push the custom log-drain Vector image to the dev ECR.
+# Mirrors cloud-app-operator's build-dev.yaml: self-hosted arm64 runner -> OIDC role
+# assumption -> ECR login -> buildx build+push, tagged with the branch name (and SHA).
+#
+# Repo/org must provide:
+#   secrets.DEV_GHA_ROLE  — IAM role (OIDC) with ecr:PutImage etc. on the target repo
+#   secrets.DEV_IMG_REPO  — e.g. 061051245504.dkr.ecr.us-east-2.amazonaws.com/laravel_vector
+# and access to the "laravel-*-arm64-ubuntu" self-hosted runner.
+name: Laravel build dev
+on:
+  push:
+    branches:
+      - "feat-logdrain-**"
+      - "logdrain-**"
+  workflow_dispatch: {}
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: "us-east-2"
+jobs:
+  build-image:
+    name: "Build & push laravel_vector"
+    runs-on: "laravel-4c16r150s-arm64-ubuntu-24.04"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS dev credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEV_GHA_ROLE }}
+          role-session-name: gha-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to dev Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: "true"
+
+      - name: Build & push image (linux/arm64)
+        env:
+          IMG_REPO: ${{ secrets.DEV_IMG_REPO }}
+        run: |
+          # Sanitize the branch name into a valid image tag (mirrors the operator job).
+          TAG=$(echo "$GITHUB_REF_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          docker buildx build \
+            --platform linux/arm64 \
+            --file Dockerfile.laravel-vector \
+            --tag "$IMG_REPO:$TAG" \
+            --tag "$IMG_REPO:$GITHUB_SHA" \
+            --push \
+            .

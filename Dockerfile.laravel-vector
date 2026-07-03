@@ -1,0 +1,36 @@
+# Custom Vector image for Laravel Cloud log drains — this fork adds delivery-health
+# observability to the aws_s3 sink (see changelog.d/s3_delivery_success_log). Built
+# from source so the fork changes are included, then packaged into a slim runtime.
+#
+# Feature set matches what the operator renders into a drain's Vector config: a kafka
+# source, internal_metrics + demo_logs sources, remap/filter transforms, and the
+# aws_s3 + prometheus_exporter sinks. Widen FEATURES if the drain pipeline grows.
+#
+# Target platform: linux/arm64 (the dev clusters run aarch64 / Graviton nodes).
+
+# ---- build stage -------------------------------------------------------------
+FROM rust:1.95-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake perl clang libclang-dev pkg-config \
+        protobuf-compiler libssl-dev libsasl2-dev zlib1g-dev unzip git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /vector
+COPY . .
+
+ARG FEATURES="sources-kafka,sources-internal_metrics,sources-demo_logs,transforms-remap,transforms-filter,sinks-aws_s3,sinks-prometheus"
+RUN cargo build --release --bin vector --no-default-features --features "${FEATURES}"
+
+# ---- runtime stage -----------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 libsasl2-2 zlib1g \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/vector
+
+COPY --from=builder /vector/target/release/vector /usr/bin/vector
+
+# Vector reads its config from /etc/vector/vector.yaml (the operator mounts it there).
+ENTRYPOINT ["/usr/bin/vector"]
