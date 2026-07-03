@@ -6,7 +6,8 @@
 # source, internal_metrics + demo_logs sources, remap/filter transforms, and the
 # aws_s3 + prometheus_exporter sinks. Widen FEATURES if the drain pipeline grows.
 #
-# Target platform: linux/arm64 (the dev clusters run aarch64 / Graviton nodes).
+# Multi-arch: built natively per platform (linux/arm64 on Graviton runners,
+# linux/amd64 on x64 runners) and merged into one manifest by the CI workflow.
 
 # ---- build stage -------------------------------------------------------------
 FROM rust:1.95-slim-bookworm AS builder
