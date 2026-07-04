@@ -24,6 +24,15 @@ COPY . .
 # API (api.enabled on 127.0.0.1:8686); it is feature-gated, so omitting it makes
 # Vector reject the config with "unknown field `api`".
 ARG FEATURES="api,sources-kafka,sources-internal_metrics,sources-demo_logs,transforms-remap,transforms-filter,sinks-aws_s3,sinks-prometheus"
+
+# Build-speed/size overrides for the dev image. Vector's release profile is tuned
+# for max runtime throughput (lto="fat", codegen-units=1) — the slowest possible to
+# compile and unnecessary for a log-drain sidecar. Disabling LTO and parallelizing
+# codegen roughly halves the cold compile; stripping shrinks the binary. Override via
+# env so Vector's Cargo.toml is untouched.
+ENV CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_STRIP=true
 RUN cargo build --release --bin vector --no-default-features --features "${FEATURES}"
 
 # ---- runtime stage -----------------------------------------------------------
