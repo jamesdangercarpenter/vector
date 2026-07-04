@@ -236,6 +236,17 @@ impl SinkConfig for S3SinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let service = self.create_service(&cx.proxy).await?;
         let healthcheck = self.build_healthcheck(service.client())?;
+        // Idle-safe detection: re-run the read-only healthcheck on an interval so a
+        // credential/reachability failure surfaces without waiting for the next
+        // organic write. Gated on healthcheck.enabled — off for the one-shot
+        // setup-check sink, which must not emit a recurring signal.
+        if cx.healthcheck.enabled {
+            s3_common::config::spawn_periodic_healthcheck(
+                self.bucket.clone(),
+                service.client(),
+                std::time::Duration::from_secs(15),
+            );
+        }
         let sink = self.build_processor(service, cx)?;
         Ok((sink, healthcheck))
     }
