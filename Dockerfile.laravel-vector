@@ -29,8 +29,11 @@ RUN cargo build --release --bin vector --no-default-features --features "${FEATU
 # ---- runtime stage -----------------------------------------------------------
 FROM debian:bookworm-slim
 
+# wget is required by the operator's drain readiness/liveness probes, which
+# exec `wget -q -O- http://127.0.0.1:8686/health` against Vector's local API.
+# The public timberio alpine image bundled it (busybox); debian-slim does not.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 libsasl2-2 zlib1g \
+        ca-certificates libssl3 libsasl2-2 zlib1g wget \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/lib/vector
 
