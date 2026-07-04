@@ -33,7 +33,15 @@ ARG FEATURES="api,sources-kafka,sources-internal_metrics,sources-demo_logs,trans
 ENV CARGO_PROFILE_RELEASE_LTO=false \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     CARGO_PROFILE_RELEASE_STRIP=true
-RUN cargo build --release --bin vector --no-default-features --features "${FEATURES}"
+# Cache the cargo registry/git and the target dir across builds so an incremental
+# rebuild recompiles only changed crates instead of the whole graph. Cache-mount
+# contents are not committed to the layer, so copy the binary out to a real path.
+# (Cross-build reuse requires a persistent buildx builder — see the CI workflow.)
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/vector/target,sharing=locked \
+    cargo build --release --bin vector --no-default-features --features "${FEATURES}" \
+    && cp /vector/target/release/vector /vector/vector
 
 # ---- runtime stage -----------------------------------------------------------
 FROM debian:bookworm-slim
@@ -46,7 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/lib/vector
 
-COPY --from=builder /vector/target/release/vector /usr/bin/vector
+COPY --from=builder /vector/vector /usr/bin/vector
 
 # Vector reads its config from /etc/vector/vector.yaml (the operator mounts it there).
 ENTRYPOINT ["/usr/bin/vector"]
