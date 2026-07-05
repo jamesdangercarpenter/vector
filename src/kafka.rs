@@ -1,18 +1,22 @@
 #![allow(missing_docs)]
 use std::{
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
-use aws_types::region::Region;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_types::{region::Region, sdk_config::SharedCredentialsProvider};
+#[cfg(feature = "sinks-kafka")]
+use rdkafka::producer::{DeliveryResult, ProducerContext};
 use rdkafka::{
-    ClientConfig, ClientContext, Statistics,
-    client::OAuthToken,
-    consumer::ConsumerContext,
-    producer::{DeliveryResult, ProducerContext},
+    ClientConfig, ClientContext, Statistics, client::OAuthToken, consumer::ConsumerContext,
 };
 use snafu::Snafu;
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::OnceCell};
 use tracing::Span;
 use vector_lib::{configurable::configurable_component, sensitive_string::SensitiveString};
 
@@ -127,6 +131,8 @@ impl KafkaAuthConfig {
         self.msk_iam.as_ref().map(|msk_iam| MskIamTokenProvider {
             region: Region::new(msk_iam.region.clone()),
             handle: Handle::current(),
+            credentials_provider: Arc::default(),
+            token_generated: Arc::default(),
         })
     }
 
@@ -235,6 +241,13 @@ fn pathbuf_to_string(path: &Path) -> crate::Result<&str> {
 pub(crate) struct MskIamTokenProvider {
     region: Region,
     handle: Handle,
+    /// The AWS credentials provider, built on first use and reused across token refreshes.
+    /// The default provider chain caches credentials internally, so reusing it avoids
+    /// re-resolving credentials (IMDS, STS, and so on) from scratch on every refresh.
+    credentials_provider: Arc<OnceCell<SharedCredentialsProvider>>,
+    /// Whether a token has been generated successfully at least once, allowing callers that
+    /// prime the initial token (the sink healthcheck) to know when to stop polling.
+    token_generated: Arc<AtomicBool>,
 }
 
 impl MskIamTokenProvider {
@@ -250,23 +263,60 @@ impl MskIamTokenProvider {
 
         let region = self.region.clone();
         let handle = self.handle.clone();
+        let credentials_provider = Arc::clone(&self.credentials_provider);
         let (token, expiration_time_ms) = std::thread::spawn(move || {
             handle.block_on(async {
-                tokio::time::timeout(
-                    TOKEN_GENERATION_TIMEOUT,
-                    aws_msk_iam_sasl_signer::generate_auth_token(region),
-                )
+                tokio::time::timeout(TOKEN_GENERATION_TIMEOUT, async {
+                    let credentials_provider = credentials_provider
+                        .get_or_init(|| {
+                            let region = region.clone();
+                            async move {
+                                SharedCredentialsProvider::new(
+                                    DefaultCredentialsChain::builder()
+                                        .region(region)
+                                        .build()
+                                        .await,
+                                )
+                            }
+                        })
+                        .await
+                        .clone();
+                    aws_msk_iam_sasl_signer::generate_auth_token_from_credentials_provider(
+                        region,
+                        credentials_provider,
+                    )
+                    .await
+                })
                 .await
             })
         })
         .join()
         .map_err(|_| "MSK IAM token generation thread panicked")???;
 
+        self.token_generated.store(true, Ordering::Release);
+
         Ok(OAuthToken {
             token,
             principal_name: String::new(),
             lifetime_ms: expiration_time_ms,
         })
+    }
+
+    /// Whether this provider has successfully generated a token at least once.
+    #[cfg(feature = "sinks-kafka")]
+    pub(crate) fn token_generated(&self) -> bool {
+        self.token_generated.load(Ordering::Acquire)
+    }
+}
+
+/// Generates an MSK IAM OAuth token via the given provider, shared by the client contexts
+/// implementing the `generate_oauth_token` callback.
+fn msk_iam_oauth_token(
+    provider: Option<&MskIamTokenProvider>,
+) -> Result<OAuthToken, Box<dyn std::error::Error>> {
+    match provider {
+        Some(provider) => provider.token(),
+        None => Err("OAUTHBEARER authentication is only supported via `msk_iam`".into()),
     }
 }
 
@@ -295,18 +345,41 @@ impl ClientContext for KafkaStatisticsContext {
         &self,
         _oauthbearer_config: Option<&str>,
     ) -> Result<OAuthToken, Box<dyn std::error::Error>> {
-        match &self.msk_iam_token_provider {
-            Some(provider) => provider.token(),
-            None => Err("OAUTHBEARER authentication is only supported via `msk_iam`".into()),
-        }
+        msk_iam_oauth_token(self.msk_iam_token_provider.as_ref())
     }
 }
 
 impl ConsumerContext for KafkaStatisticsContext {}
 
+/// Client context for the sink healthcheck producer.
+///
+/// Serves MSK IAM authentication tokens like [`KafkaStatisticsContext`], but does not emit
+/// statistics metrics: the healthcheck producer is short-lived and sends no data, so its
+/// statistics would only pollute the component's metrics.
+#[cfg(feature = "sinks-kafka")]
+pub(crate) struct KafkaHealthcheckContext {
+    pub(crate) msk_iam_token_provider: Option<MskIamTokenProvider>,
+}
+
+#[cfg(feature = "sinks-kafka")]
+impl ClientContext for KafkaHealthcheckContext {
+    const ENABLE_REFRESH_OAUTH_TOKEN: bool = KafkaStatisticsContext::ENABLE_REFRESH_OAUTH_TOKEN;
+
+    // Ignore statistics rather than logging them like the default implementation does.
+    fn stats(&self, _statistics: Statistics) {}
+
+    fn generate_oauth_token(
+        &self,
+        _oauthbearer_config: Option<&str>,
+    ) -> Result<OAuthToken, Box<dyn std::error::Error>> {
+        msk_iam_oauth_token(self.msk_iam_token_provider.as_ref())
+    }
+}
+
 // Required to use the context with a `BaseProducer` (the sink healthcheck); delivery reports
 // are not consumed there.
-impl ProducerContext for KafkaStatisticsContext {
+#[cfg(feature = "sinks-kafka")]
+impl ProducerContext for KafkaHealthcheckContext {
     type DeliveryOpaque = ();
 
     fn delivery(&self, _report: &DeliveryResult<'_>, _opaque: Self::DeliveryOpaque) {}

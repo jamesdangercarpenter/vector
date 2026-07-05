@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rdkafka::{
     ClientConfig,
@@ -13,7 +13,7 @@ use vrl::path::OwnedTargetPath;
 use super::config::KafkaSinkConfig;
 use crate::{
     config::SinkHealthcheckOptions,
-    kafka::{KafkaStatisticsContext, MskIamTokenProvider},
+    kafka::{KafkaHealthcheckContext, KafkaStatisticsContext, MskIamTokenProvider},
     sinks::{
         kafka::{request_builder::KafkaRequestBuilder, service::KafkaService},
         prelude::*,
@@ -136,18 +136,22 @@ pub(crate) async fn healthcheck(
 
     let msk_iam_token_provider = config.auth.msk_iam_token_provider();
     tokio::task::spawn_blocking(move || {
-        let has_msk_iam = msk_iam_token_provider.is_some();
-        let producer: BaseProducer<KafkaStatisticsContext> = client_config
-            .create_with_context(KafkaStatisticsContext {
-                expose_lag_metrics: false,
-                span: Span::current(),
-                msk_iam_token_provider,
+        let producer: BaseProducer<KafkaHealthcheckContext> = client_config
+            .create_with_context(KafkaHealthcheckContext {
+                msk_iam_token_provider: msk_iam_token_provider.clone(),
             })
             .unwrap();
-        if has_msk_iam {
+        if let Some(token_provider) = msk_iam_token_provider {
             // Serve the initial OAuth token refresh event so an MSK IAM token is set before
-            // connecting to fetch metadata.
-            producer.poll(Duration::from_secs(1));
+            // connecting to fetch metadata. librdkafka emits the refresh event asynchronously
+            // shortly after client creation and the token generation callback runs
+            // synchronously within `poll`, so poll until a token has been generated or the
+            // healthcheck timeout elapses (in which case `fetch_metadata` below surfaces the
+            // authentication error).
+            let deadline = Instant::now() + healthcheck_options.timeout;
+            while !token_provider.token_generated() && Instant::now() < deadline {
+                producer.poll(Duration::from_millis(100));
+            }
         }
         let topic = topic.as_ref().map(|topic| &topic[..]);
 
