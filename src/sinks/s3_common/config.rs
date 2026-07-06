@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use aws_sdk_s3::{
     Client as S3Client,
+    error::ProvideErrorMetadata,
     operation::put_object::PutObjectError,
     types::{ObjectCannedAcl, ServerSideEncryption, StorageClass},
 };
@@ -395,20 +397,103 @@ pub enum HealthcheckError {
     UnknownBucket { bucket: String },
     #[snafu(display("Unknown status code: {}", status))]
     UnknownStatus { status: StatusCode },
+    #[snafu(display("Write permission denied on bucket {:?}: {}", bucket, error_code))]
+    WriteDenied { bucket: String, error_code: String },
+}
+
+/// Runs the read-only HeadBucket healthcheck once, mapping an S3 error to a concise
+/// reason (Invalid credentials / Unknown bucket / status). Shared by the startup
+/// healthcheck and the periodic one below so both classify failures identically.
+async fn head_bucket_reason(bucket: &str, client: &S3Client) -> crate::Result<()> {
+    match client
+        .head_bucket()
+        .bucket(bucket.to_string())
+        .set_expected_bucket_owner(None)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(SdkError::ServiceError(inner)) => {
+            let status = inner.into_raw().status();
+            Err(match status.as_u16() {
+                status::FORBIDDEN => HealthcheckError::InvalidCredentials.into(),
+                status::NOT_FOUND => HealthcheckError::UnknownBucket {
+                    bucket: bucket.to_string(),
+                }
+                .into(),
+                _ => HealthcheckError::UnknownStatus { status }.into(),
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn build_healthcheck(bucket: String, client: S3Client) -> crate::Result<Healthcheck> {
+    Ok(async move { head_bucket_reason(&bucket, &client).await }.boxed())
+}
+
+/// Spawns a background task that re-runs the read-only HeadBucket healthcheck every
+/// `interval`, so a credential/reachability failure on an IDLE drain (no writes to
+/// fail) surfaces within `interval` instead of waiting for the next organic write. On
+/// failure it logs `Healthcheck failed.` scoped to `component_type=aws_s3` — the same
+/// line Vector emits at startup — so log-based consumers pick it up with no new
+/// contract. Read-only: no PutObject, hence no storage cost and no s3:ObjectCreated
+/// notifications (the reason the recurring WRITE probe was removed).
+pub fn spawn_periodic_healthcheck(bucket: String, client: S3Client, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The immediate first tick is redundant with the startup healthcheck.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Err(error) = head_bucket_reason(&bucket, &client).await {
+                warn!(
+                    message = "Healthcheck failed.",
+                    component_type = "aws_s3",
+                    error = %error,
+                    internal_log_rate_limit = false,
+                );
+            }
+        }
+    });
+}
+
+/// Derives the write-check marker key from the sink's (possibly templated)
+/// `key_prefix`, using only its static leading portion (the part before the first
+/// `%`/`{` template token). This puts the marker under the SAME prefix scope as real
+/// writes — so a role scoped to that prefix validates correctly — without needing to
+/// render template variables at startup. An empty static prefix (fully templated)
+/// falls back to the bucket root.
+fn write_check_key(key_prefix: &str) -> String {
+    let static_len = key_prefix
+        .find(|c| c == '%' || c == '{')
+        .unwrap_or(key_prefix.len());
+    format!("{}.vector-write-check", &key_prefix[..static_len])
+}
+
+/// Like [`build_healthcheck`] but additionally validates WRITE permission by putting
+/// a tiny marker object under the sink's key prefix — catching write-permission
+/// misconfiguration that the read-only `HeadBucket` check cannot see (a role can pass
+/// `HeadBucket`/list yet be denied `PutObject`). Opt-in via `verify_write_permission`.
+///
+/// NOTE: the marker object is left in place (overwritten each start), so this leaves
+/// one small object under the prefix.
+pub fn build_write_healthcheck(
+    bucket: String,
+    key_prefix: String,
+    client: S3Client,
+) -> crate::Result<Healthcheck> {
     let healthcheck = async move {
-        let req = client
+        // Read check first (same semantics as build_healthcheck).
+        if let Err(error) = client
             .head_bucket()
             .bucket(bucket.clone())
             .set_expected_bucket_owner(None)
             .send()
-            .await;
-
-        match req {
-            Ok(_) => Ok(()),
-            Err(error) => Err(match error {
+            .await
+        {
+            return Err(match error {
                 SdkError::ServiceError(inner) => {
                     let status = inner.into_raw().status();
                     match status.as_u16() {
@@ -418,7 +503,28 @@ pub fn build_healthcheck(bucket: String, client: S3Client) -> crate::Result<Heal
                     }
                 }
                 error => error.into(),
-            }),
+            });
+        }
+
+        // Write check: a real PutObject of a small marker (overwritten each start).
+        match client
+            .put_object()
+            .bucket(bucket.clone())
+            .key(write_check_key(&key_prefix))
+            .body(aws_smithy_types::byte_stream::ByteStream::from_static(
+                b"vector write check",
+            ))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let error_code = error
+                    .code()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown".to_string());
+                Err(HealthcheckError::WriteDenied { bucket, error_code }.into())
+            }
         }
     };
 

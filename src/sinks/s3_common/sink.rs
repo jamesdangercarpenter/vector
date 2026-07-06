@@ -46,6 +46,14 @@ where
         let settings = self.batcher_settings;
         let request_builder = self.request_builder;
 
+        // Publish delivery_up=1 at startup (optimistic: an idle sink that hasn't
+        // written yet is healthy) so the gauge has a value even for a drain that
+        // never writes. Runs in the component span, so it carries component_id. The
+        // per-request path (see s3_common::service) flips it on the first real
+        // success/failure transition.
+        #[allow(clippy::disallowed_macros)]
+        metrics::gauge!("aws_s3_delivery_up").set(1.0);
+
         input
             .batched_partitioned(partitioner, settings.timeout, |_| {
                 settings.as_byte_size_config()
