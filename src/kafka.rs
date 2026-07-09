@@ -269,7 +269,10 @@ impl MskIamTokenProvider {
     /// short-lived thread instead. librdkafka refreshes tokens at 80% of their advertised
     /// lifetime, which is capped to [`MAX_ADVERTISED_TOKEN_LIFETIME`], so this is infrequent.
     fn token(&self) -> Result<OAuthToken, Box<dyn std::error::Error>> {
-        const TOKEN_GENERATION_TIMEOUT: Duration = Duration::from_secs(10);
+        // Bounds the whole operation: default-chain credential resolution plus signing. Sized
+        // to absorb a slow credential source on cold start (for example an EKS Pod Identity or
+        // IMDS agent) without hanging the sink healthcheck indefinitely.
+        const TOKEN_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
         let region = self.region.clone();
         let handle = self.handle.clone();
