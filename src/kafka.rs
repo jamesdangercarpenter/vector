@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
@@ -250,14 +250,24 @@ pub(crate) struct MskIamTokenProvider {
     token_generated: Arc<AtomicBool>,
 }
 
+/// Upper bound on the token lifetime advertised to librdkafka.
+///
+/// MSK IAM tokens are actually valid for 15 minutes, but librdkafka schedules its refresh at
+/// 80% of the advertised lifetime, so advertising the full lifetime leaves only ~3 minutes of
+/// real validity by refresh time. During SASL re-authentication (`connections.max.reauth.ms`)
+/// MSK rejects a token with too little remaining lifetime as "Session too short", causing
+/// reconnect churn. Advertising a shorter lifetime makes librdkafka refresh sooner (~80% of
+/// this bound), keeping the live token well clear of its true expiry with ample re-auth headroom.
+const MAX_ADVERTISED_TOKEN_LIFETIME: Duration = Duration::from_secs(9 * 60);
+
 impl MskIamTokenProvider {
     /// Generates a fresh MSK IAM authentication token.
     ///
     /// librdkafka invokes the token refresh callback either from one of its own threads or from
     /// the thread polling the client queue, which may be a Tokio worker thread. Blocking on the
     /// async token generation directly could panic or stall the runtime, so it is run on a
-    /// short-lived thread instead. Tokens are valid for 15 minutes and librdkafka refreshes them
-    /// at 80% of their lifetime, so this is infrequent.
+    /// short-lived thread instead. librdkafka refreshes tokens at 80% of their advertised
+    /// lifetime, which is capped to [`MAX_ADVERTISED_TOKEN_LIFETIME`], so this is infrequent.
     fn token(&self) -> Result<OAuthToken, Box<dyn std::error::Error>> {
         const TOKEN_GENERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -298,7 +308,7 @@ impl MskIamTokenProvider {
         Ok(OAuthToken {
             token,
             principal_name: String::new(),
-            lifetime_ms: expiration_time_ms,
+            lifetime_ms: cap_token_lifetime(expiration_time_ms),
         })
     }
 
@@ -307,6 +317,20 @@ impl MskIamTokenProvider {
     pub(crate) fn token_generated(&self) -> bool {
         self.token_generated.load(Ordering::Acquire)
     }
+}
+
+/// Caps the token expiry (absolute milliseconds since the Unix epoch, as returned by the AWS
+/// signer and expected by librdkafka) so the advertised lifetime never exceeds
+/// [`MAX_ADVERTISED_TOKEN_LIFETIME`]. Returns the real expiry unchanged if it is already sooner,
+/// or if the system clock is somehow before the Unix epoch (in which case capping would
+/// misfire and constant re-authentication is worse than no cap).
+fn cap_token_lifetime(expiration_time_ms: i64) -> i64 {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return expiration_time_ms;
+    };
+    let capped_expiry =
+        (now.as_millis() as i64).saturating_add(MAX_ADVERTISED_TOKEN_LIFETIME.as_millis() as i64);
+    expiration_time_ms.min(capped_expiry)
 }
 
 /// Generates an MSK IAM OAuth token via the given provider, shared by the client contexts
@@ -435,6 +459,33 @@ mod test {
         };
         let error = auth.apply(&mut ClientConfig::new()).unwrap_err();
         assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn cap_token_lifetime_caps_far_future_expiry() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        // A real MSK token expiring ~15 minutes out is capped to the advertised bound.
+        let real_expiry = now_ms + 15 * 60 * 1000;
+        let capped = cap_token_lifetime(real_expiry);
+        assert!(capped < real_expiry);
+        let advertised_lifetime = capped - now_ms;
+        let bound = MAX_ADVERTISED_TOKEN_LIFETIME.as_millis() as i64;
+        // Allow a small window for the clock advancing between the two `now` reads.
+        assert!((advertised_lifetime - bound).abs() < 1000);
+    }
+
+    #[test]
+    fn cap_token_lifetime_leaves_near_expiry_untouched() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        // An expiry already sooner than the bound is returned unchanged.
+        let real_expiry = now_ms + 60 * 1000;
+        assert_eq!(cap_token_lifetime(real_expiry), real_expiry);
     }
 
     #[test]
