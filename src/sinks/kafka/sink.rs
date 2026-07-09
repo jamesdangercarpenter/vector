@@ -153,7 +153,7 @@ pub(crate) async fn healthcheck(
                 producer.poll(Duration::from_millis(100));
             }
         }
-        let topic = topic.as_ref().map(|topic| &topic[..]);
+        let topic = topic.as_deref();
 
         producer
             .client()

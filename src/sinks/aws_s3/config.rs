@@ -115,6 +115,14 @@ pub struct S3SinkConfig {
     #[configurable(metadata(docs::examples = "json"))]
     pub filename_extension: Option<String>,
 
+    /// Validate WRITE permission at startup by putting a small marker object under the
+    /// configured `key_prefix`, in addition to the read-only bucket healthcheck.
+    /// Catches write-permission misconfiguration — which the default `HeadBucket`
+    /// check cannot detect — before any events flow. The marker is left in place
+    /// (overwritten each start).
+    #[serde(default)]
+    pub verify_write_permission: bool,
+
     #[serde(flatten)]
     pub options: S3Options,
 
@@ -202,6 +210,7 @@ impl GenerateConfig for S3SinkConfig {
             filename_time_format: default_filename_time_format(),
             filename_append_uuid: true,
             filename_extension: None,
+            verify_write_permission: false,
             options: S3Options::default(),
             region: RegionOrEndpoint::default(),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
@@ -227,6 +236,17 @@ impl SinkConfig for S3SinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let service = self.create_service(&cx.proxy).await?;
         let healthcheck = self.build_healthcheck(service.client())?;
+        // Idle-safe detection: re-run the read-only healthcheck on an interval so a
+        // credential/reachability failure surfaces without waiting for the next
+        // organic write. Gated on healthcheck.enabled — off for the one-shot
+        // setup-check sink, which must not emit a recurring signal.
+        if cx.healthcheck.enabled {
+            s3_common::config::spawn_periodic_healthcheck(
+                self.bucket.clone(),
+                service.client(),
+                std::time::Duration::from_secs(15),
+            );
+        }
         let sink = self.build_processor(service, cx)?;
         Ok((sink, healthcheck))
     }
@@ -352,7 +372,15 @@ impl S3SinkConfig {
     }
 
     pub fn build_healthcheck(&self, client: S3Client) -> crate::Result<Healthcheck> {
-        s3_common::config::build_healthcheck(self.bucket.clone(), client)
+        if self.verify_write_permission {
+            s3_common::config::build_write_healthcheck(
+                self.bucket.clone(),
+                self.key_prefix.clone(),
+                client,
+            )
+        } else {
+            s3_common::config::build_healthcheck(self.bucket.clone(), client)
+        }
     }
 
     pub async fn create_service(&self, proxy: &ProxyConfig) -> crate::Result<S3Service> {
@@ -380,23 +408,17 @@ mod tests {
     #[cfg(feature = "codecs-parquet")]
     #[test]
     fn parquet_batch_encoding_correct_toml_shape() {
-        let config: S3SinkConfig = toml::from_str(
-            r#"
-            bucket = "test-bucket"
-            compression = "none"
-
-            [encoding]
-            codec = "text"
-
-            [batch_encoding]
-            schema_mode = "auto_infer"
-            codec = "parquet"
-
-            [batch_encoding.compression]
-            algorithm = "snappy"
-
-            "#,
-        )
+        let config: S3SinkConfig = serde_yaml::from_str(indoc::indoc! {r#"
+            bucket: test-bucket
+            compression: none
+            encoding:
+              codec: text
+            batch_encoding:
+              schema_mode: auto_infer
+              codec: parquet
+              compression:
+                algorithm: snappy
+            "#})
         .expect("correct batch_encoding shape should parse");
 
         let batch_enc = config
@@ -434,6 +456,7 @@ mod tests {
             filename_time_format: super::default_filename_time_format(),
             filename_append_uuid: true,
             filename_extension: None,
+            verify_write_permission: false,
             options: S3Options::default(),
             region: crate::aws::RegionOrEndpoint::with_both("us-east-1", "http://localhost:4566"),
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
@@ -470,24 +493,19 @@ mod tests {
     #[cfg(feature = "codecs-parquet")]
     #[test]
     fn parquet_content_type_user_override_preserved() {
-        let config: S3SinkConfig = toml::from_str(
-            r#"
-            bucket = "test-bucket"
-            compression = "none"
-            content_type = "application/octet-stream"
-
-            [encoding]
-            codec = "text"
-
-            [batch_encoding]
-            codec = "parquet"
-            schema_mode = "auto_infer"
-
-            [batch_encoding.compression]
-            algorithm = "gzip"
-            level = 9
-            "#,
-        )
+        let config: S3SinkConfig = serde_yaml::from_str(indoc::indoc! {r#"
+            bucket: test-bucket
+            compression: none
+            content_type: "application/octet-stream"
+            encoding:
+              codec: text
+            batch_encoding:
+              codec: parquet
+              schema_mode: auto_infer
+              compression:
+                algorithm: gzip
+                level: 9
+            "#})
         .unwrap();
 
         let super::S3BatchEncoding::Parquet(p) = config.batch_encoding.as_ref().unwrap();
@@ -534,20 +552,16 @@ mod tests {
     #[cfg(feature = "codecs-parquet")]
     #[test]
     fn parquet_filename_extension_user_override() {
-        let config: S3SinkConfig = toml::from_str(
-            r#"
-            bucket = "test-bucket"
-            compression = "none"
-            filename_extension = "pq"
-
-            [encoding]
-            codec = "text"
-
-            [batch_encoding]
-            codec = "parquet"
-            schema_mode = "auto_infer"
-            "#,
-        )
+        let config: S3SinkConfig = serde_yaml::from_str(indoc::indoc! {r#"
+            bucket: test-bucket
+            compression: none
+            filename_extension: pq
+            encoding:
+              codec: text
+            batch_encoding:
+              codec: parquet
+              schema_mode: auto_infer
+            "#})
         .unwrap();
 
         assert_eq!(config.filename_extension.as_deref(), Some("pq"));
@@ -559,18 +573,14 @@ mod tests {
     fn parquet_schema_mode_defaults_to_relaxed() {
         use vector_lib::codecs::encoding::format::ParquetSchemaMode;
 
-        let config: S3SinkConfig = toml::from_str(
-            r#"
-            bucket = "test-bucket"
-            compression = "none"
-
-            [encoding]
-            codec = "text"
-
-            [batch_encoding]
-            codec = "parquet"
-            "#,
-        )
+        let config: S3SinkConfig = serde_yaml::from_str(indoc::indoc! {r#"
+            bucket: test-bucket
+            compression: none
+            encoding:
+              codec: text
+            batch_encoding:
+              codec: parquet
+            "#})
         .unwrap();
 
         let super::S3BatchEncoding::Parquet(p) = config.batch_encoding.unwrap();
@@ -583,20 +593,16 @@ mod tests {
     fn parquet_schema_mode_strict_parsed() {
         use vector_lib::codecs::encoding::format::ParquetSchemaMode;
 
-        let config: S3SinkConfig = toml::from_str(
-            r#"
-            bucket = "test-bucket"
-            compression = "none"
-
-            [encoding]
-            codec = "text"
-
-            [batch_encoding]
-            codec = "parquet"
-            schema_mode = "strict"
-            schema_file = "tmp/something.schema"
-            "#,
-        )
+        let config: S3SinkConfig = serde_yaml::from_str(indoc::indoc! {r#"
+            bucket: test-bucket
+            compression: none
+            encoding:
+              codec: text
+            batch_encoding:
+              codec: parquet
+              schema_mode: strict
+              schema_file: tmp/something.schema
+            "#})
         .unwrap();
 
         let super::S3BatchEncoding::Parquet(p) = config.batch_encoding.unwrap();
