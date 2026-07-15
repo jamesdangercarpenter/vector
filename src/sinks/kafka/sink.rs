@@ -136,6 +136,9 @@ pub(crate) async fn healthcheck(
 
     let msk_iam_token_provider = config.auth.msk_iam_token_provider();
     tokio::task::spawn_blocking(move || {
+        // One deadline bounds the whole healthcheck (token priming plus metadata fetch) so a
+        // slow token cold start cannot stack a second full timeout on top of the first.
+        let deadline = Instant::now() + healthcheck_options.timeout;
         let producer: BaseProducer<KafkaHealthcheckContext> = client_config
             .create_with_context(KafkaHealthcheckContext {
                 msk_iam_token_provider: msk_iam_token_provider.clone(),
@@ -145,11 +148,13 @@ pub(crate) async fn healthcheck(
             // Serve the initial OAuth token refresh event so an MSK IAM token is set before
             // connecting to fetch metadata. librdkafka emits the refresh event asynchronously
             // shortly after client creation and the token generation callback runs
-            // synchronously within `poll`, so poll until a token has been generated or the
-            // healthcheck timeout elapses (in which case `fetch_metadata` below surfaces the
-            // authentication error).
-            let deadline = Instant::now() + healthcheck_options.timeout;
-            while !token_provider.token_generated() && Instant::now() < deadline {
+            // synchronously within `poll`, so poll until a token has been generated or half
+            // the healthcheck timeout elapses. Priming is capped to half the budget so
+            // `fetch_metadata` below always has time left to surface the authentication
+            // error. Note a `poll` that dispatches the token callback blocks until token
+            // generation completes or times out, so the cap can be overshot by that much.
+            let priming_deadline = Instant::now() + healthcheck_options.timeout / 2;
+            while !token_provider.token_generated() && Instant::now() < priming_deadline {
                 producer.poll(Duration::from_millis(100));
             }
         }
@@ -157,7 +162,7 @@ pub(crate) async fn healthcheck(
 
         producer
             .client()
-            .fetch_metadata(topic, healthcheck_options.timeout)
+            .fetch_metadata(topic, deadline.saturating_duration_since(Instant::now()))
             .map(|_| ())
     })
     .await??;
