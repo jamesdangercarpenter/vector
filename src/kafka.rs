@@ -492,6 +492,62 @@ mod test {
     }
 
     #[test]
+    fn msk_iam_token_provider_generates_capped_token() {
+        // MSK IAM token generation is entirely local: the "token" is a SigV4-presigned URL
+        // for the `kafka-cluster:Connect` action, so static credentials from the environment
+        // exercise the full generation path (thread spawn, credential chain, signer, lifetime
+        // cap) without any AWS access.
+        //
+        // SAFETY: tests run under nextest, one process per test, so no other thread can be
+        // reading the environment concurrently.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+            std::env::set_var(
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            );
+        }
+
+        // A multi-threaded runtime, kept otherwise idle so its workers can drive the token
+        // generation future that `token` blocks on from its own short-lived thread.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let auth = KafkaAuthConfig {
+            sasl: None,
+            tls: None,
+            msk_iam: Some(msk_iam_config()),
+        };
+        let provider = {
+            let _guard = runtime.enter();
+            auth.msk_iam_token_provider().unwrap()
+        };
+        assert!(!provider.token_generated.load(Ordering::Acquire));
+
+        let token = provider.token().unwrap();
+
+        // The token is the base64url-encoded presigned URL, so it starts with the encoding
+        // of `https://kafk` (the longest prefix aligned to a whole base64 input group).
+        assert!(
+            token.token.starts_with("aHR0cHM6Ly9rYWZr"),
+            "not a base64url-encoded MSK presigned URL: {}",
+            token.token
+        );
+
+        // The signer returns a ~15 minute expiry, so the advertised expiry must have been
+        // capped: still in the future, close to the cap, and never beyond it.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let bound = MAX_ADVERTISED_TOKEN_LIFETIME.as_millis() as i64;
+        assert!(token.lifetime_ms > now_ms);
+        assert!(token.lifetime_ms <= now_ms + bound);
+        // Allow for clocks advancing while the token was generated.
+        assert!(token.lifetime_ms >= now_ms + bound - 30_000);
+
+        assert!(provider.token_generated.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn msk_iam_rejects_disabled_tls() {
         let auth = KafkaAuthConfig {
             sasl: None,
