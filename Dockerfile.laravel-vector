@@ -28,10 +28,12 @@ COPY . .
 # `api` is required because the operator-rendered config enables Vector's local
 # API (api.enabled on 127.0.0.1:8686); it is feature-gated, so omitting it makes
 # Vector reject the config with "unknown field `api`".
-# `vrl-functions-env` restores VRL's `get_env_var` (e.g. the observability-ingest
-# enrich_vector_metrics remap tags events from AWS_REGION etc.) — upstream VRL split
-# it out of the base stdlib, so slim builds must opt back in.
-ARG FEATURES="api,sources-kafka,sources-internal_metrics,sources-demo_logs,sources-prometheus-scrape,transforms-remap,transforms-filter,sinks-aws_s3,sinks-clickhouse,sinks-http,sinks-prometheus,vrl-functions-env"
+# The `vrl-functions-*` features restore VRL stdlib groups that upstream VRL split
+# out of the base stdlib, so slim builds must opt back in: `env` for `get_env_var`
+# (enrich_vector_metrics tags events from AWS_REGION etc.) and `crypto` for hashing
+# (shape_exception_events fingerprints via `md5`). `system` and `network` remain
+# deliberately excluded until a pipeline needs them.
+ARG FEATURES="api,sources-kafka,sources-internal_metrics,sources-demo_logs,sources-prometheus-scrape,transforms-remap,transforms-filter,sinks-aws_s3,sinks-clickhouse,sinks-http,sinks-prometheus,vrl-functions-env,vrl-functions-crypto"
 
 # Build-speed/size overrides for the dev image. Vector's release profile is tuned
 # for max runtime throughput (lto="fat", codegen-units=1) — the slowest possible to
