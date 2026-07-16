@@ -1,0 +1,67 @@
+# Laravel Cloud — build & push the release laravel_vector image to the immutable
+# staging/production ECR. Triggered by fork release tags (v<upstream>-laravel.<n>,
+# e.g. v0.57.0-laravel.1); the image tag is the git tag without the leading "v".
+# arm64-only: the entire Laravel Cloud fleet (the app-operator, every cstmr
+# cluster, and the observability-ingest ECS services) runs on Graviton/arm64.
+#
+# Repo/org must provide (delivered by cloud-infrastructure terraform/global/laravel-vector-ecr.tf):
+#   secrets.GHA_ROLE  — IAM role (OIDC) with ecr:PutImage etc. on the target repo
+#   secrets.IMG_REPO  — e.g. 061051245504.dkr.ecr.us-east-2.amazonaws.com/laravel-cloud-global-laravel-vector
+# and access to the "laravel-*-arm64-ubuntu" self-hosted runner.
+name: Laravel build release
+on:
+  push:
+    tags:
+      - "v*-laravel*"
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: "us-east-2"
+jobs:
+  build:
+    name: "Build & push laravel_vector release (arm64)"
+    runs-on: "laravel-4c16r150s-arm64-ubuntu-24.04"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GHA_ROLE }}
+          role-session-name: gha-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Use a persistent builder (cargo cache mounts survive across runs)
+        run: |
+          # Reuse the same named docker-container builder as the dev workflow so
+          # its BuildKit cache (the cargo registry/git + target mounts) persists
+          # between runs on the self-hosted host. Create-if-missing keeps it
+          # idempotent; falls back to no cross-run cache on an ephemeral runner.
+          docker buildx inspect laravel-vector >/dev/null 2>&1 \
+            || docker buildx create --name laravel-vector --driver docker-container --bootstrap
+          docker buildx use laravel-vector
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: "true"
+
+      - name: Build & push image (linux/arm64)
+        env:
+          IMG_REPO: ${{ secrets.IMG_REPO }}
+        run: |
+          # Image tag = git tag minus the leading "v" (v0.57.0-laravel.1 → 0.57.0-laravel.1).
+          # The target repo is immutable, so only the version tag is pushed — no
+          # floating SHA/latest tags that a rebuild would collide with.
+          TAG="${GITHUB_REF_NAME#v}"
+          docker buildx build \
+            --platform linux/arm64 \
+            --file Dockerfile.laravel-vector \
+            --tag "$IMG_REPO:$TAG" \
+            --push \
+            .

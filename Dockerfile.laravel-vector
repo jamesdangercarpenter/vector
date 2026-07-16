@@ -1,10 +1,15 @@
-# Custom Vector image for Laravel Cloud log drains — this fork adds delivery-health
-# observability to the aws_s3 sink (see changelog.d/s3_delivery_success_log). Built
-# from source so the fork changes are included, then packaged into a slim runtime.
+# Custom Vector image for Laravel Cloud — this fork adds delivery-health
+# observability to the aws_s3 sink (see changelog.d/s3_delivery_success_log) and
+# native AWS_MSK_IAM auth for the kafka source/sink (changelog.d/kafka_msk_iam_auth).
+# Built from source so the fork changes are included, then packaged into a slim runtime.
 #
-# Feature set matches what the operator renders into a drain's Vector config: a kafka
-# source, internal_metrics + demo_logs sources, remap/filter transforms, and the
-# aws_s3 + prometheus_exporter sinks. Widen FEATURES if the drain pipeline grows.
+# Feature set covers both consumers of this image:
+#   - operator-rendered log-drain pipelines: kafka source, internal_metrics +
+#     demo_logs sources, remap/filter transforms, aws_s3 + prometheus_exporter sinks.
+#   - observability-ingest ECS services (cloud-terraform-aws-region): kafka +
+#     prometheus_scrape sources, remap/filter transforms, clickhouse +
+#     prometheus_remote_write + http sinks.
+# Widen FEATURES if either pipeline grows.
 #
 # Target platform: linux/arm64 — the whole Laravel Cloud fleet (operator + all
 # cstmr clusters) runs on Graviton/arm64 nodes, so no x86 build is needed.
@@ -23,7 +28,7 @@ COPY . .
 # `api` is required because the operator-rendered config enables Vector's local
 # API (api.enabled on 127.0.0.1:8686); it is feature-gated, so omitting it makes
 # Vector reject the config with "unknown field `api`".
-ARG FEATURES="api,sources-kafka,sources-internal_metrics,sources-demo_logs,transforms-remap,transforms-filter,sinks-aws_s3,sinks-prometheus"
+ARG FEATURES="api,sources-kafka,sources-internal_metrics,sources-demo_logs,sources-prometheus-scrape,transforms-remap,transforms-filter,sinks-aws_s3,sinks-clickhouse,sinks-http,sinks-prometheus"
 
 # Build-speed/size overrides for the dev image. Vector's release profile is tuned
 # for max runtime throughput (lto="fat", codegen-units=1) — the slowest possible to
