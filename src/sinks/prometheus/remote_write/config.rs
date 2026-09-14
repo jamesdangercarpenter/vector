@@ -111,7 +111,7 @@ pub struct RemoteWriteConfig {
     #[configurable(derived)]
     pub auth: Option<PrometheusRemoteWriteAuth>,
 
-    #[cfg(feature = "aws-config")]
+    #[cfg(feature = "aws-core")]
     #[configurable(derived)]
     #[configurable(metadata(docs::advanced))]
     pub aws: Option<crate::aws::RegionOrEndpoint>,
