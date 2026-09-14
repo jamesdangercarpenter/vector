@@ -1,0 +1,67 @@
+# Laravel Cloud — build & push the custom log-drain Vector image to the dev ECR.
+# arm64-only: the entire Laravel Cloud fleet (the app-operator and every cstmr
+# cluster) runs on Graviton/arm64 nodes, so there is no x86 target. Built natively
+# on the arm64 runner and pushed tagged with the branch name (and SHA).
+#
+# Repo/org must provide:
+#   secrets.DEV_GHA_ROLE  — IAM role (OIDC) with ecr:PutImage etc. on the target repo
+#   secrets.DEV_IMG_REPO  — e.g. 061051245504.dkr.ecr.us-east-2.amazonaws.com/laravel-cloud-global-laravel-vector-dev
+# and access to the "laravel-*-arm64-ubuntu" self-hosted runner.
+name: Laravel build dev
+on:
+  push:
+    branches:
+      - "feat-logdrain-**"
+      - "logdrain-**"
+  workflow_dispatch: {}
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: "us-east-2"
+jobs:
+  build:
+    name: "Build & push laravel_vector (arm64)"
+    runs-on: "laravel-4c16r150s-arm64-ubuntu-24.04"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS dev credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEV_GHA_ROLE }}
+          role-session-name: gha-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Use a persistent builder (cargo cache mounts survive across runs)
+        run: |
+          # Reuse one named docker-container builder so its BuildKit cache (the cargo
+          # registry/git + target mounts) persists between runs on the self-hosted host.
+          # Create-if-missing keeps it idempotent; falls back to no cross-run cache on
+          # an ephemeral runner (still correct, just cold).
+          docker buildx inspect laravel-vector >/dev/null 2>&1 \
+            || docker buildx create --name laravel-vector --driver docker-container --bootstrap
+          docker buildx use laravel-vector
+
+      - name: Login to dev Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: "true"
+
+      - name: Build & push image (linux/arm64)
+        env:
+          IMG_REPO: ${{ secrets.DEV_IMG_REPO }}
+        run: |
+          # Sanitize the branch name into a valid image tag (mirrors the operator job).
+          TAG=$(echo "$GITHUB_REF_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          docker buildx build \
+            --platform linux/arm64 \
+            --file Dockerfile.laravel-vector \
+            --tag "$IMG_REPO:$TAG" \
+            --tag "$IMG_REPO:$GITHUB_SHA" \
+            --push \
+            .
