@@ -591,6 +591,16 @@ components: sources: internal_metrics: {
 				error_code: _aws_s3_error_code
 			}
 		}
+		aws_s3_objects_delivered_total: {
+			description: """
+				The total number of objects the `aws_s3` sink has successfully written, incremented
+				once per successful `PutObject`. `component_sent_events_total` counts the events
+				inside those objects rather than the objects themselves.
+				"""
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
 		kafka_queue_messages: {
 			description:       "Current number of messages in producer queues."
 			type:              "gauge"

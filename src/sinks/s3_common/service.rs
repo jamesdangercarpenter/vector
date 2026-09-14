@@ -13,7 +13,9 @@ use md5::Digest;
 use tower::Service;
 use tracing::Instrument;
 use vector_lib::{
+    counter,
     event::{EventFinalizers, EventStatus, Finalizable},
+    internal_event::CounterName,
     request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
     stream::DriverResponse,
 };
@@ -130,6 +132,9 @@ impl Service<S3Request> for S3Service {
                     bucket = request.bucket,
                     key = request.metadata.s3_key
                 );
+                // One per successful `PutObject`, i.e. per object, where
+                // `component_sent_events_total` counts the events inside it.
+                counter!(CounterName::AwsS3ObjectsDeliveredTotal).increment(1);
 
                 S3Response { events_byte_size }
             })
