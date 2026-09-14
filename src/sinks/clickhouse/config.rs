@@ -16,7 +16,10 @@ use crate::{
     http::{Auth, HttpClient, MaybeAuth},
     sinks::{
         prelude::*,
-        util::{RealtimeSizeBasedDefaultBatchSettings, UriSerde, http::HttpService},
+        util::{
+            RealtimeSizeBasedDefaultBatchSettings, UriSerde,
+            http::{HttpService, RetryStrategy},
+        },
     },
 };
 
@@ -150,6 +153,30 @@ pub struct ClickhouseConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub query_settings: QuerySettingsConfig,
+
+    /// Which HTTP responses are treated as retriable.
+    ///
+    /// Matters more here than it looks. A response classified as non-retriable
+    /// makes the sink drop the batch, which finalizes it as `Rejected`. For a
+    /// source with end-to-end acknowledgements that is not inert: the Kafka
+    /// source commits a single offset watermark per partition, so the next batch
+    /// that *does* succeed stores an offset past every rejected batch behind it,
+    /// and that data is gone with consumer lag never showing it.
+    ///
+    /// The default strategy treats any non-5xx other than 429/408 as
+    /// non-retriable — including a 404, which is what ClickHouse returns for an
+    /// unknown table. Sinks that must not lose events should retry those
+    /// instead, so the batch never resolves and the watermark cannot advance
+    /// past it:
+    ///
+    /// ```yaml
+    /// retry_strategy:
+    ///   type: custom
+    ///   status_codes: [401, 403, 404, 408, 429]
+    /// ```
+    #[configurable(derived)]
+    #[serde(default)]
+    pub retry_strategy: RetryStrategy,
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -234,7 +261,10 @@ impl SinkConfig for ClickhouseConfig {
         let request_limits = self.request.into_settings();
 
         let service = ServiceBuilder::new()
-            .settings(request_limits, ClickhouseRetryLogic::default())
+            .settings(
+                request_limits,
+                ClickhouseRetryLogic::new(self.retry_strategy.clone()),
+            )
             .service(service);
 
         let batch_settings = self.batch.into_batcher_settings()?;
