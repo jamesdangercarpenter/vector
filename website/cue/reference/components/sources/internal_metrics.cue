@@ -580,6 +580,17 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              internal_metrics_cardinality.tags
 		}
+		aws_s3_delivery_errors_total: {
+			description: """
+				The total number of `PutObject` attempts by the `aws_s3` sink that returned an
+				error, including attempts that were subsequently retried successfully.
+				"""
+			type:              "counter"
+			default_namespace: "vector"
+			tags: _component_tags & {
+				error_code: _aws_s3_error_code
+			}
+		}
 		kafka_queue_messages: {
 			description:       "Current number of messages in producer queues."
 			type:              "gauge"
@@ -1192,6 +1203,15 @@ components: sources: internal_metrics: {
 		_buffer_id: {
 			description: "The unique identifier of the buffer."
 			required:    true
+		}
+		_aws_s3_error_code: {
+			description: """
+				The reason the attempt failed: the S3 error code (for example `AccessDenied`,
+				`NoSuchBucket`, `SlowDown`), `Timeout` when `request.timeout_secs` elapsed, or the
+				AWS SDK error variant (`DispatchFailure`, `TimeoutError`, `ResponseError`,
+				`ConstructionFailure`) for transport failures.
+				"""
+			required: true
 		}
 		_buffer_error_code: {
 			description: "The specific error code emitted for a buffer read failure."

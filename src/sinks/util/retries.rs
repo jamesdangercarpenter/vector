@@ -53,6 +53,10 @@ pub trait RetryLogic: Clone + Send + Sync + 'static {
 
     /// Optional hook run when an error is determined to be retriable.
     fn on_retriable_error(&self, _error: &Self::Error) {}
+
+    /// Optional hook run on every attempt that returns an error, whether or not it will be
+    /// retried. Runs before `is_retriable_error`.
+    fn on_request_error(&self, _error: &Error) {}
 }
 
 /// The jitter mode to use for retry backoff behavior.
@@ -185,6 +189,8 @@ where
                 RetryAction::Successful => None,
             },
             Err(error) => {
+                self.logic.on_request_error(error);
+
                 if self.remaining_attempts == 0 {
                     error!(message = "Retries exhausted; dropping the request.", %error);
                     return None;

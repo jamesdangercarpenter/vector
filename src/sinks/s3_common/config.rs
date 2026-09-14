@@ -17,7 +17,7 @@ use aws_smithy_runtime_api::{
 use bytes::Bytes;
 use futures::FutureExt;
 use snafu::Snafu;
-use vector_lib::configurable::configurable_component;
+use vector_lib::{configurable::configurable_component, counter, internal_event::CounterName};
 
 use super::service::{S3Request, S3Response, S3Service, put_object_request};
 use crate::{
@@ -390,6 +390,31 @@ impl RetryLogic for RetryStrategy {
                 is_retriable_error(error) || should_retry_error(Some(status_codes.clone()), error)
             }
         }
+    }
+
+    // Runs on every failed `PutObject` attempt, including ones that succeed on retry.
+    fn on_request_error(&self, error: &crate::Error) {
+        counter!(
+            CounterName::AwsS3DeliveryErrorsTotal,
+            "error_code" => delivery_error_code(error),
+        )
+        .increment(1);
+    }
+}
+
+/// The `error_code` label for a failed `PutObject` attempt: the S3 error code for a
+/// service error, `Timeout` when the request exceeded `request.timeout_secs`, and the
+/// `SdkError` variant name for transport failures.
+fn delivery_error_code(error: &crate::Error) -> String {
+    if let Some(error) = error.downcast_ref::<SdkError<PutObjectError, HttpResponse>>() {
+        s3_error_code(error)
+    } else if error
+        .downcast_ref::<tower::timeout::error::Elapsed>()
+        .is_some()
+    {
+        "Timeout".to_string()
+    } else {
+        "Unknown".to_string()
     }
 }
 
