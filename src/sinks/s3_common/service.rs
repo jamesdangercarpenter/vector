@@ -1,6 +1,9 @@
 use std::task::{Context, Poll};
 
-use aws_sdk_s3::{Client as S3Client, operation::put_object::PutObjectError};
+use aws_sdk_s3::{
+    Client as S3Client,
+    operation::put_object::{PutObjectError, builders::PutObjectFluentBuilder},
+};
 use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
 use aws_smithy_types::byte_stream::ByteStream;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
@@ -101,22 +104,6 @@ impl Service<S3Request> for S3Service {
         let options = request.options;
 
         let content_encoding = request.content_encoding;
-        let content_encoding = options
-            .content_encoding
-            .or_else(|| content_encoding.map(|ce| ce.to_string()));
-        let content_type = options
-            .content_type
-            .or_else(|| Some("text/x-log".to_owned()));
-
-        let content_md5 = BASE64_STANDARD.encode(md5::Md5::digest(&request.body));
-
-        let tagging = options.tags.map(|tags| {
-            let mut tagging = url::form_urlencoded::Serializer::new(String::new());
-            for (p, v) in &tags {
-                tagging.append_pair(p, v);
-            }
-            tagging.finish()
-        });
 
         let events_byte_size = request
             .request_metadata
@@ -125,23 +112,14 @@ impl Service<S3Request> for S3Service {
         let client = self.client.clone();
 
         Box::pin(async move {
-            let put_request = client
-                .put_object()
-                .body(bytes_to_bytestream(request.body))
-                .bucket(request.bucket.clone())
-                .key(request.metadata.s3_key.clone())
-                .set_content_encoding(content_encoding)
-                .set_content_type(content_type)
-                .set_acl(options.acl.map(Into::into))
-                .set_grant_full_control(options.grant_full_control)
-                .set_grant_read(options.grant_read)
-                .set_grant_read_acp(options.grant_read_acp)
-                .set_grant_write_acp(options.grant_write_acp)
-                .set_server_side_encryption(options.server_side_encryption.map(Into::into))
-                .set_ssekms_key_id(options.ssekms_key_id)
-                .set_storage_class(Some(options.storage_class.into()))
-                .set_tagging(tagging)
-                .content_md5(content_md5);
+            let put_request = put_object_request(
+                &client,
+                request.bucket.clone(),
+                request.metadata.s3_key.clone(),
+                request.body,
+                content_encoding,
+                options,
+            );
 
             let result = put_request.send().in_current_span().await;
 
@@ -157,6 +135,53 @@ impl Service<S3Request> for S3Service {
             })
         })
     }
+}
+
+/// Builds the `PutObject` request for `body` with the sink's configured options. Shared by
+/// the request path and the startup write-permission check so both are subject to the
+/// same bucket policy.
+pub(super) fn put_object_request(
+    client: &S3Client,
+    bucket: String,
+    key: String,
+    body: Bytes,
+    content_encoding: Option<&'static str>,
+    options: S3Options,
+) -> PutObjectFluentBuilder {
+    let content_encoding = options
+        .content_encoding
+        .or_else(|| content_encoding.map(|ce| ce.to_string()));
+    let content_type = options
+        .content_type
+        .or_else(|| Some("text/x-log".to_owned()));
+
+    let content_md5 = BASE64_STANDARD.encode(md5::Md5::digest(&body));
+
+    let tagging = options.tags.map(|tags| {
+        let mut tagging = url::form_urlencoded::Serializer::new(String::new());
+        for (p, v) in &tags {
+            tagging.append_pair(p, v);
+        }
+        tagging.finish()
+    });
+
+    client
+        .put_object()
+        .body(bytes_to_bytestream(body))
+        .bucket(bucket)
+        .key(key)
+        .set_content_encoding(content_encoding)
+        .set_content_type(content_type)
+        .set_acl(options.acl.map(Into::into))
+        .set_grant_full_control(options.grant_full_control)
+        .set_grant_read(options.grant_read)
+        .set_grant_read_acp(options.grant_read_acp)
+        .set_grant_write_acp(options.grant_write_acp)
+        .set_server_side_encryption(options.server_side_encryption.map(Into::into))
+        .set_ssekms_key_id(options.ssekms_key_id)
+        .set_storage_class(Some(options.storage_class.into()))
+        .set_tagging(tagging)
+        .content_md5(content_md5)
 }
 
 fn bytes_to_bytestream(buf: Bytes) -> ByteStream {

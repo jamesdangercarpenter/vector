@@ -1444,4 +1444,16 @@ generated: components: sinks: aws_s3: configuration: {
 			}
 		}
 	}
+	verify_write_permission: {
+		description: """
+			Validate write permission at startup by putting a small marker object under the
+			configured `key_prefix`, in addition to the read-only bucket healthcheck.
+
+			Catches write-permission misconfiguration, which the default `HeadBucket` check
+			cannot detect, before any events flow. The marker is left in place and overwritten
+			on each start.
+			"""
+		required: false
+		type: bool: default: false
+	}
 }

@@ -1,19 +1,25 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    time::Duration,
+};
 
 use aws_sdk_s3::{
     Client as S3Client,
-    operation::put_object::PutObjectError,
+    error::ProvideErrorMetadata,
+    operation::{head_bucket::HeadBucketError, put_object::PutObjectError},
     types::{ObjectCannedAcl, ServerSideEncryption, StorageClass},
 };
 use aws_smithy_runtime_api::{
     client::{orchestrator::HttpResponse, result::SdkError},
     http::StatusCode,
 };
+use bytes::Bytes;
 use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::configurable::configurable_component;
 
-use super::service::{S3Request, S3Response, S3Service};
+use super::service::{S3Request, S3Response, S3Service, put_object_request};
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint, create_client, is_retriable_error},
     common::s3::S3ClientBuilder,
@@ -395,34 +401,190 @@ pub enum HealthcheckError {
     UnknownBucket { bucket: String },
     #[snafu(display("Unknown status code: {}", status))]
     UnknownStatus { status: StatusCode },
+    #[snafu(display("Write permission denied on bucket {:?}: {}", bucket, error_code))]
+    WriteDenied { bucket: String, error_code: String },
+    #[snafu(display(
+        "Write check on bucket {:?} failed after {} attempts: {}",
+        bucket,
+        attempts,
+        error_code
+    ))]
+    WriteFailed {
+        bucket: String,
+        attempts: u32,
+        error_code: String,
+    },
+}
+
+/// Runs the read-only HeadBucket check once.
+async fn head_bucket(
+    bucket: &str,
+    client: &S3Client,
+) -> Result<(), SdkError<HeadBucketError, HttpResponse>> {
+    client
+        .head_bucket()
+        .bucket(bucket.to_string())
+        .set_expected_bucket_owner(None)
+        .send()
+        .await
+        .map(|_| ())
+}
+
+/// Maps a HeadBucket error to a concise reason (Invalid credentials / Unknown bucket /
+/// status), shared by the read-only and write healthchecks so both classify identically.
+fn head_bucket_reason(
+    bucket: &str,
+    error: SdkError<HeadBucketError, HttpResponse>,
+) -> crate::Error {
+    match error {
+        SdkError::ServiceError(inner) => {
+            let status = inner.into_raw().status();
+            match status.as_u16() {
+                status::FORBIDDEN => HealthcheckError::InvalidCredentials.into(),
+                status::NOT_FOUND => HealthcheckError::UnknownBucket {
+                    bucket: bucket.to_string(),
+                }
+                .into(),
+                _ => HealthcheckError::UnknownStatus { status }.into(),
+            }
+        }
+        error => error.into(),
+    }
 }
 
 pub fn build_healthcheck(bucket: String, client: S3Client) -> crate::Result<Healthcheck> {
-    let healthcheck = async move {
-        let req = client
-            .head_bucket()
-            .bucket(bucket.clone())
-            .set_expected_bucket_owner(None)
-            .send()
-            .await;
+    Ok(async move {
+        head_bucket(&bucket, &client)
+            .await
+            .map_err(|error| head_bucket_reason(&bucket, error))
+    }
+    .boxed())
+}
 
-        match req {
-            Ok(_) => Ok(()),
-            Err(error) => Err(match error {
-                SdkError::ServiceError(inner) => {
-                    let status = inner.into_raw().status();
-                    match status.as_u16() {
-                        status::FORBIDDEN => HealthcheckError::InvalidCredentials.into(),
-                        status::NOT_FOUND => HealthcheckError::UnknownBucket { bucket }.into(),
-                        _ => HealthcheckError::UnknownStatus { status }.into(),
-                    }
-                }
-                error => error.into(),
-            }),
+/// The S3 error code for a failed request (`AccessDenied`, `NoSuchBucket`, `SlowDown`, ...),
+/// falling back to the `SdkError` variant name for transport-level failures.
+fn s3_error_code<E: ProvideErrorMetadata>(error: &SdkError<E, HttpResponse>) -> String {
+    match error {
+        SdkError::ServiceError(inner) => inner
+            .err()
+            .code()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Http{}", inner.raw().status().as_u16())),
+        SdkError::ConstructionFailure(_) => "ConstructionFailure".to_string(),
+        SdkError::TimeoutError(_) => "TimeoutError".to_string(),
+        SdkError::DispatchFailure(_) => "DispatchFailure".to_string(),
+        SdkError::ResponseError(_) => "ResponseError".to_string(),
+        _ => "Unknown".to_string(),
+    }
+}
+
+/// Derives the write-check marker key from the sink's (possibly templated)
+/// `key_prefix`, using only its static leading portion (the part before the first
+/// `%`/`{` template token). This puts the marker under the SAME prefix scope as real
+/// writes — so a role scoped to that prefix validates correctly — without needing to
+/// render template variables at startup. An empty static prefix (fully templated)
+/// falls back to the bucket root.
+fn write_check_key(key_prefix: &str) -> String {
+    let (static_prefix, _) = key_prefix
+        .find(['%', '{'])
+        .map_or((key_prefix, ""), |at| key_prefix.split_at(at));
+    format!("{static_prefix}.vector-write-check")
+}
+
+/// Body of the startup marker object.
+const WRITE_CHECK_BODY: &[u8] = b"vector write check";
+
+/// Attempts the startup write check makes before a transient failure (timeout, dropped
+/// connection, 5xx, throttling) counts. The healthcheck client has SDK retries disabled,
+/// so without this one blip would fail the check. Bounded so the check still finishes
+/// inside the default 10s healthcheck timeout.
+const WRITE_CHECK_ATTEMPTS: u32 = 3;
+const WRITE_CHECK_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Runs `request` up to `WRITE_CHECK_ATTEMPTS` times, retrying only what the AWS retry
+/// classifier calls transient. A permission or bucket error returns on the first attempt.
+async fn retry_transient<T, E, Fut>(
+    operation: &str,
+    mut request: impl FnMut() -> Fut,
+) -> Result<T, SdkError<E, HttpResponse>>
+where
+    E: ProvideErrorMetadata,
+    Fut: Future<Output = Result<T, SdkError<E, HttpResponse>>>,
+{
+    let mut attempt = 1;
+    loop {
+        match request().await {
+            Err(error) if attempt < WRITE_CHECK_ATTEMPTS && is_retriable_error(&error) => {
+                debug!(
+                    message = "Startup write check hit a transient error; retrying.",
+                    operation,
+                    attempt,
+                    error_code = s3_error_code(&error).as_str(),
+                );
+                tokio::time::sleep(WRITE_CHECK_BACKOFF * attempt).await;
+                attempt += 1;
+            }
+            result => return result,
         }
-    };
+    }
+}
 
-    Ok(healthcheck.boxed())
+/// Like [`build_healthcheck`] but additionally validates WRITE permission by putting
+/// a tiny marker object under the sink's key prefix — catching write-permission
+/// misconfiguration that the read-only `HeadBucket` check cannot see (a role can pass
+/// `HeadBucket`/list yet be denied `PutObject`). Opt-in via `verify_write_permission`.
+///
+/// The marker is sent with the sink's configured options (SSE-KMS key, ACL, grants,
+/// storage class, tags) so a policy on any of them denies the marker exactly as it
+/// would deny real data.
+///
+/// NOTE: the marker object is left in place (overwritten each start), so this leaves
+/// one small object under the prefix.
+pub fn build_write_healthcheck(
+    bucket: String,
+    key_prefix: String,
+    options: S3Options,
+    client: S3Client,
+) -> crate::Result<Healthcheck> {
+    Ok(async move {
+        // Read check first, classified exactly as `build_healthcheck` would.
+        retry_transient("HeadBucket", || head_bucket(&bucket, &client))
+            .await
+            .map_err(|error| head_bucket_reason(&bucket, error))?;
+
+        let key = write_check_key(&key_prefix);
+        let result = retry_transient("PutObject", || {
+            put_object_request(
+                &client,
+                bucket.clone(),
+                key.clone(),
+                Bytes::from_static(WRITE_CHECK_BODY),
+                None,
+                options.clone(),
+            )
+            .send()
+        })
+        .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let error_code = s3_error_code(&error);
+                // Name the failure honestly: a connection reset is not a permission denial.
+                Err(if is_retriable_error(&error) {
+                    HealthcheckError::WriteFailed {
+                        bucket,
+                        attempts: WRITE_CHECK_ATTEMPTS,
+                        error_code,
+                    }
+                } else {
+                    HealthcheckError::WriteDenied { bucket, error_code }
+                }
+                .into())
+            }
+        }
+    }
+    .boxed())
 }
 
 pub async fn create_service(

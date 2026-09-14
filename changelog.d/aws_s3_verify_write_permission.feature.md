@@ -1,0 +1,3 @@
+The `aws_s3` sink gained an opt-in `verify_write_permission` option. When enabled, the startup healthcheck writes a small `.vector-write-check` marker object under the static part of the configured `key_prefix`, in addition to the read-only `HeadBucket` check, so a role that can read the bucket but is denied `PutObject` fails the healthcheck before any events flow. The marker is sent with the sink's configured options (SSE-KMS key, ACL, grants, storage class, tags), so it is subject to the same bucket policy as real data. Transient errors are retried up to three times and reported as a write failure rather than a permission denial.
+
+authors: jamesdangercarpenter
