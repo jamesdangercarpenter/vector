@@ -580,17 +580,29 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              internal_metrics_cardinality.tags
 		}
-		aws_s3_delivery_errors_total: {
+		aws_s3_delivery_errors_count: {
 			description: """
-				The total number of `PutObject` attempts by the `aws_s3` sink that returned an
-				error, including attempts that were subsequently retried successfully.
-				Registered at zero when an `aws_s3` sink is configured.
+				The number of `PutObject` attempts by the `aws_s3` sink that returned an error,
+				including attempts that were subsequently retried successfully, labelled by
+				`error_code`. Series appear as each error code is first seen; use
+				`aws_s3_delivery_errors_total` for an unlabelled series that exists from startup.
 				"""
 			type:              "counter"
 			default_namespace: "vector"
 			tags: _component_tags & {
 				error_code: _aws_s3_error_code
 			}
+		}
+		aws_s3_delivery_errors_total: {
+			description: """
+				The total number of `PutObject` attempts by the `aws_s3` sink that returned an
+				error, including attempts that were subsequently retried successfully.
+				Registered at zero when an `aws_s3` sink is configured. See
+				`aws_s3_delivery_errors_count` for the same count broken down by `error_code`.
+				"""
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
 		}
 		aws_s3_objects_delivered_total: {
 			description: """
@@ -603,19 +615,31 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              _component_tags
 		}
-		aws_s3_objects_errored_total: {
+		aws_s3_objects_errored_count: {
 			description: """
-				The total number of objects whose `PutObject` returned an error at least once,
-				counted once per object on its first error and labelled with that error. Retries
-				of the same object do not increment it, unlike `aws_s3_delivery_errors_total`,
-				which counts every errored attempt.
-				Registered at zero when an `aws_s3` sink is configured.
+				The number of objects whose `PutObject` returned an error at least once, counted
+				once per object on its first error and labelled with that error's `error_code`.
+				Retries of the same object do not increment it. Series appear as each error code
+				is first seen; use `aws_s3_objects_errored_total` for an unlabelled series that
+				exists from startup.
 				"""
 			type:              "counter"
 			default_namespace: "vector"
 			tags: _component_tags & {
 				error_code: _aws_s3_error_code
 			}
+		}
+		aws_s3_objects_errored_total: {
+			description: """
+				The total number of objects whose `PutObject` returned an error at least once,
+				counted once per object on its first error. Retries of the same object do not
+				increment it, unlike `aws_s3_delivery_errors_total`, which counts every errored
+				attempt. Registered at zero when an `aws_s3` sink is configured. See
+				`aws_s3_objects_errored_count` for the same count broken down by `error_code`.
+				"""
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
 		}
 		kafka_queue_messages: {
 			description:       "Current number of messages in producer queues."

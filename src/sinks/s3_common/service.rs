@@ -145,8 +145,8 @@ impl Service<S3Request> for S3Service {
 /// Registers the sink's delivery counters at zero so they are exported as soon as the sink
 /// is configured, rather than appearing only after the first increment. Must be called
 /// inside the sink's component span so the series carry the component tags. The
-/// `error_code`-labelled counters are registered without that label, since the codes are
-/// not known up front; `sum by (component_id)` therefore reads zero instead of no data.
+/// `error_code`-labelled `_count` counters are not registered here, since the codes are not
+/// known up front; the unlabelled `_total` counters cover the "no errors yet" case.
 pub fn register_delivery_metrics() {
     counter!(CounterName::AwsS3ObjectsDeliveredTotal).absolute(0);
     counter!(CounterName::AwsS3ObjectsErroredTotal).absolute(0);

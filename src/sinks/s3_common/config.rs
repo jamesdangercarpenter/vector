@@ -392,20 +392,24 @@ impl RetryLogic for RetryStrategy {
         }
     }
 
-    // Runs on every failed `PutObject` attempt, including ones that succeed on retry.
+    // Runs on every failed `PutObject` attempt, including ones that succeed on retry. The
+    // `_total` counter is unlabelled so it can be registered at zero; the `_count` counter
+    // carries the `error_code` label.
     fn on_request_error(&self, error: &crate::Error) {
+        counter!(CounterName::AwsS3DeliveryErrorsTotal).increment(1);
         counter!(
-            CounterName::AwsS3DeliveryErrorsTotal,
+            CounterName::AwsS3DeliveryErrorsCount,
             "error_code" => delivery_error_code(error),
         )
         .increment(1);
     }
 
-    // Runs once per object whose `PutObject` errored at least once, labelled with the
-    // first error seen. Retries of the same object do not count again.
+    // Runs once per object whose `PutObject` errored at least once. Retries of the same
+    // object do not count again. The `_count` counter is labelled with the first error seen.
     fn on_request_first_error(&self, error: &crate::Error) {
+        counter!(CounterName::AwsS3ObjectsErroredTotal).increment(1);
         counter!(
-            CounterName::AwsS3ObjectsErroredTotal,
+            CounterName::AwsS3ObjectsErroredCount,
             "error_code" => delivery_error_code(error),
         )
         .increment(1);
