@@ -347,6 +347,7 @@ components: sinks: aws_s3: components._aws & {
 	telemetry: metrics: {
 		aws_s3_delivery_errors_total:   components.sources.internal_metrics.output.metrics.aws_s3_delivery_errors_total
 		aws_s3_objects_delivered_total: components.sources.internal_metrics.output.metrics.aws_s3_objects_delivered_total
+		aws_s3_objects_errored_total:   components.sources.internal_metrics.output.metrics.aws_s3_objects_errored_total
 	}
 
 	permissions: iam: [

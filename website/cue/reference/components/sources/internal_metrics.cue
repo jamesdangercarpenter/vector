@@ -601,6 +601,19 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              _component_tags
 		}
+		aws_s3_objects_errored_total: {
+			description: """
+				The total number of objects whose `PutObject` returned an error at least once,
+				counted once per object on its first error and labelled with that error. Retries
+				of the same object do not increment it, unlike `aws_s3_delivery_errors_total`,
+				which counts every errored attempt.
+				"""
+			type:              "counter"
+			default_namespace: "vector"
+			tags: _component_tags & {
+				error_code: _aws_s3_error_code
+			}
+		}
 		kafka_queue_messages: {
 			description:       "Current number of messages in producer queues."
 			type:              "gauge"

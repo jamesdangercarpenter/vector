@@ -400,6 +400,16 @@ impl RetryLogic for RetryStrategy {
         )
         .increment(1);
     }
+
+    // Runs once per object whose `PutObject` errored at least once, labelled with the
+    // first error seen. Retries of the same object do not count again.
+    fn on_request_first_error(&self, error: &crate::Error) {
+        counter!(
+            CounterName::AwsS3ObjectsErroredTotal,
+            "error_code" => delivery_error_code(error),
+        )
+        .increment(1);
+    }
 }
 
 /// The `error_code` label for a failed `PutObject` attempt: the S3 error code for a

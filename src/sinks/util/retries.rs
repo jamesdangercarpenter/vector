@@ -57,6 +57,10 @@ pub trait RetryLogic: Clone + Send + Sync + 'static {
     /// Optional hook run on every attempt that returns an error, whether or not it will be
     /// retried. Runs before `is_retriable_error`.
     fn on_request_error(&self, _error: &Error) {}
+
+    /// Optional hook run at most once per request, on its first attempt that returns an
+    /// error. Later errors from retries of the same request do not run it.
+    fn on_request_first_error(&self, _error: &Error) {}
 }
 
 /// The jitter mode to use for retry backoff behavior.
@@ -81,6 +85,9 @@ pub enum JitterMode {
 #[derive(Debug, Clone)]
 pub struct FibonacciRetryPolicy<L> {
     remaining_attempts: usize,
+    /// Whether any attempt of this request has errored. Per request: the policy is cloned
+    /// for each request.
+    errored: bool,
     previous_duration: Duration,
     current_duration: Duration,
     jitter_mode: JitterMode,
@@ -103,6 +110,7 @@ impl<L: RetryLogic> FibonacciRetryPolicy<L> {
     ) -> Self {
         FibonacciRetryPolicy {
             remaining_attempts,
+            errored: false,
             previous_duration: Duration::from_secs(0),
             current_duration: initial_backoff,
             jitter_mode,
@@ -190,6 +198,10 @@ where
             },
             Err(error) => {
                 self.logic.on_request_error(error);
+                if !self.errored {
+                    self.errored = true;
+                    self.logic.on_request_first_error(error);
+                }
 
                 if self.remaining_attempts == 0 {
                     error!(message = "Retries exhausted; dropping the request.", %error);
@@ -266,7 +278,14 @@ impl<Request> RetryAction<Request> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt, time::Duration};
+    use std::{
+        fmt,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use tokio::time;
     use tokio_test::{assert_pending, assert_ready_err, assert_ready_ok, task};
@@ -464,6 +483,71 @@ mod tests {
         fn is_retriable_error(&self, error: &Self::Error) -> bool {
             error.0
         }
+    }
+
+    /// Counts hook invocations.
+    #[derive(Debug, Clone, Default)]
+    struct CountingRetryLogic {
+        errors: Arc<AtomicUsize>,
+        first_errors: Arc<AtomicUsize>,
+    }
+
+    impl RetryLogic for CountingRetryLogic {
+        type Error = Error;
+        type Request = &'static str;
+        type Response = &'static str;
+
+        fn is_retriable_error(&self, error: &Self::Error) -> bool {
+            error.0
+        }
+
+        fn on_request_error(&self, _error: &crate::Error) {
+            self.errors.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_request_first_error(&self, _error: &crate::Error) {
+            self.first_errors.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_error_hook_fires_once_per_request() {
+        trace_init();
+        time::pause();
+
+        let logic = CountingRetryLogic::default();
+        let policy = FibonacciRetryPolicy::new(
+            usize::MAX,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            logic.clone(),
+            JitterMode::None,
+        );
+        let (mut svc, mut handle) = mock::spawn_layer(RetryLayer::new(policy));
+
+        // First request: errors twice, then succeeds. First-error fires once.
+        assert_ready_ok!(svc.poll_ready());
+        let mut fut = task::spawn(svc.call("hello"));
+        assert_request_eq!(handle, "hello").send_error(Error(true));
+        assert_pending!(fut.poll());
+        time::advance(Duration::from_secs(2)).await;
+        assert_pending!(fut.poll());
+        assert_request_eq!(handle, "hello").send_error(Error(true));
+        assert_pending!(fut.poll());
+        time::advance(Duration::from_secs(3)).await;
+        assert_pending!(fut.poll());
+        assert_request_eq!(handle, "hello").send_response("world");
+        assert_eq!(fut.await.unwrap(), "world");
+        assert_eq!(logic.errors.load(Ordering::SeqCst), 2);
+        assert_eq!(logic.first_errors.load(Ordering::SeqCst), 1);
+
+        // Second request on the same service: its own first error counts again.
+        assert_ready_ok!(svc.poll_ready());
+        let mut fut = task::spawn(svc.call("again"));
+        assert_request_eq!(handle, "again").send_error(Error(false));
+        assert_ready_err!(fut.poll());
+        assert_eq!(logic.errors.load(Ordering::SeqCst), 3);
+        assert_eq!(logic.first_errors.load(Ordering::SeqCst), 2);
     }
 
     #[derive(Debug, Clone)]
