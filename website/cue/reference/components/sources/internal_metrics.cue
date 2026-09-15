@@ -584,6 +584,7 @@ components: sources: internal_metrics: {
 			description: """
 				The total number of `PutObject` attempts by the `aws_s3` sink that returned an
 				error, including attempts that were subsequently retried successfully.
+				Registered at zero when an `aws_s3` sink is configured.
 				"""
 			type:              "counter"
 			default_namespace: "vector"
@@ -596,6 +597,7 @@ components: sources: internal_metrics: {
 				The total number of objects the `aws_s3` sink has successfully written, incremented
 				once per successful `PutObject`. `component_sent_events_total` counts the events
 				inside those objects rather than the objects themselves.
+				Registered at zero when an `aws_s3` sink is configured.
 				"""
 			type:              "counter"
 			default_namespace: "vector"
@@ -607,6 +609,7 @@ components: sources: internal_metrics: {
 				counted once per object on its first error and labelled with that error. Retries
 				of the same object do not increment it, unlike `aws_s3_delivery_errors_total`,
 				which counts every errored attempt.
+				Registered at zero when an `aws_s3` sink is configured.
 				"""
 			type:              "counter"
 			default_namespace: "vector"

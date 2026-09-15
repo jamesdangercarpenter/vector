@@ -235,6 +235,8 @@ impl GenerateConfig for S3SinkConfig {
 #[typetag::serde(name = "aws_s3")]
 impl SinkConfig for S3SinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Runs inside the component span, so the zero series carry component tags.
+        s3_common::service::register_delivery_metrics();
         let service = self.create_service(&cx.proxy).await?;
         let healthcheck = self.build_healthcheck(service.client())?;
         let sink = self.build_processor(service, cx)?;

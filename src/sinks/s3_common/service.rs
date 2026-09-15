@@ -142,6 +142,17 @@ impl Service<S3Request> for S3Service {
     }
 }
 
+/// Registers the sink's delivery counters at zero so they are exported as soon as the sink
+/// is configured, rather than appearing only after the first increment. Must be called
+/// inside the sink's component span so the series carry the component tags. The
+/// `error_code`-labelled counters are registered without that label, since the codes are
+/// not known up front; `sum by (component_id)` therefore reads zero instead of no data.
+pub fn register_delivery_metrics() {
+    counter!(CounterName::AwsS3ObjectsDeliveredTotal).absolute(0);
+    counter!(CounterName::AwsS3ObjectsErroredTotal).absolute(0);
+    counter!(CounterName::AwsS3DeliveryErrorsTotal).absolute(0);
+}
+
 /// Builds the `PutObject` request for `body` with the sink's configured options. Shared by
 /// the request path and the startup write-permission check so both are subject to the
 /// same bucket policy.
@@ -191,4 +202,36 @@ pub(super) fn put_object_request(
 
 fn bytes_to_bytestream(buf: Bytes) -> ByteStream {
     ByteStream::from(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use vector_lib::{event::MetricValue, metrics::Controller};
+
+    use super::register_delivery_metrics;
+
+    #[test]
+    fn delivery_metrics_are_registered_at_zero() {
+        crate::test_util::trace_init();
+        let controller = Controller::get().expect("metrics controller");
+
+        register_delivery_metrics();
+
+        let captured = controller.capture_metrics();
+        for name in [
+            "aws_s3_objects_delivered_total",
+            "aws_s3_objects_errored_total",
+            "aws_s3_delivery_errors_total",
+        ] {
+            let metric = captured
+                .iter()
+                .find(|m| m.name() == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            assert_eq!(
+                *metric.value(),
+                MetricValue::Counter { value: 0.0 },
+                "{name}"
+            );
+        }
+    }
 }
